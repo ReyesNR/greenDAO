@@ -26,7 +26,10 @@ import android.database.sqlite.SQLiteStatement;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import de.greenrobot.dao.identityscope.IdentityScope;
 import de.greenrobot.dao.identityscope.IdentityScopeLong;
@@ -64,6 +67,56 @@ public abstract class AbstractDao<T, K> {
     protected final AbstractDaoSession session;
     protected final int pkOrdinal;
 
+    private static Set<DAOTrigger> triggerInsertBefore;
+    private static Set<DAOTrigger> triggerInsertInstead;
+    private static Set<DAOTrigger> triggerInsertAfter;
+
+    private static Set<DAOTrigger> triggerUpdateBefore;
+    private static Set<DAOTrigger> triggerUpdateInstead;
+    private static Set<DAOTrigger> triggerUpdateAfter;
+
+    private static Set<DAOTrigger> triggerDeleteBefore;
+    private static Set<DAOTrigger> triggerDeleteInstead;
+    private static Set<DAOTrigger> triggerDeleteAfter;
+
+
+    public static void addTriggerInsertBefore(DAOTrigger trigger) {
+        triggerInsertBefore.add(trigger);
+    }
+
+    public static void addTriggerInsertInstead(DAOTrigger trigger) {
+        triggerInsertInstead.add(trigger);
+    }
+
+    public static void addTriggerInsertAfter(DAOTrigger trigger) {
+        triggerInsertAfter.add(trigger);
+    }
+
+    public static void addTriggerUpdateBefore(DAOTrigger trigger) {
+        triggerUpdateBefore.add(trigger);
+    }
+
+    public static void addTriggerUpdateInstead(DAOTrigger trigger) {
+        triggerUpdateInstead.add(trigger);
+    }
+
+    public static void addTriggerUpdateAfter(DAOTrigger trigger) {
+        triggerUpdateAfter.add(trigger);
+    }
+
+    public static void addTriggerDeleteBefore(DAOTrigger trigger) {
+        triggerDeleteBefore.add(trigger);
+    }
+
+    public static void addTriggerDeleteInstead(DAOTrigger trigger) {
+        triggerDeleteInstead.add(trigger);
+    }
+
+    public static void addTriggerDeleteAfter(DAOTrigger DAOTrigger) {
+        addTriggerDeleteAfter(DAOTrigger);
+    }
+
+
     public AbstractDao(DaoConfig config) {
         this(config, null);
     }
@@ -80,6 +133,7 @@ public abstract class AbstractDao<T, K> {
         statements = config.statements;
         pkOrdinal = config.pkProperty != null ? config.pkProperty.ordinal : -1;
     }
+
 
     public AbstractDaoSession getSession() {
         return session;
@@ -124,6 +178,7 @@ public abstract class AbstractDao<T, K> {
         if (key == null) {
             return null;
         }
+        
         if (identityScope != null) {
             T entity = identityScope.get(key);
             if (entity != null) {
@@ -160,13 +215,17 @@ public abstract class AbstractDao<T, K> {
         return loadCurrent(cursor, 0, true);
     }
 
-    /** Loads all available entities from the database. */
+    /**
+     * Loads all available entities from the database.
+     */
     public List<T> loadAll() {
         Cursor cursor = db.rawQuery(statements.getSelectAll(), null);
         return loadAllAndCloseCursor(cursor);
     }
 
-    /** Detaches an entity from the identity scope (session). Subsequent query results won't return this object. */
+    /**
+     * Detaches an entity from the identity scope (session). Subsequent query results won't return this object.
+     */
     public boolean detach(T entity) {
         if (identityScope != null) {
             K key = getKeyVerified(entity);
@@ -256,7 +315,7 @@ public abstract class AbstractDao<T, K> {
         insertOrReplaceInTx(Arrays.asList(entities), isEntityUpdateable());
     }
 
-    private void executeInsertInTx(SQLiteStatement stmt, Iterable<T> entities, boolean setPrimaryKey) {
+    private void executeInsertInTx(SQLiteStatement stmt, Iterable<T> entities, boolean setPrimaryKey) throws DaoException {
         db.beginTransaction();
         try {
             synchronized (stmt) {
@@ -265,12 +324,25 @@ public abstract class AbstractDao<T, K> {
                 }
                 try {
                     for (T entity : entities) {
-                        bindValues(stmt, entity);
-                        if (setPrimaryKey) {
-                            long rowId = stmt.executeInsert();
-                            updateKeyAfterInsertAndAttach(entity, rowId, false);
+                        for (DAOTrigger dt : triggerInsertBefore) {
+                            dt.executeTrigger(null, entity, db);
+                        }
+
+                        if (!triggerInsertInstead.isEmpty()) {
+                            for (DAOTrigger<T> dt : triggerInsertInstead) {
+                                dt.executeTrigger(null, entity, db);
+                            }
                         } else {
-                            stmt.execute();
+                            bindValues(stmt, entity);
+                            if (setPrimaryKey) {
+                                long rowId = stmt.executeInsert();
+                                updateKeyAfterInsertAndAttach(entity, rowId, false);
+                            } else {
+                                stmt.execute();
+                            }
+                        }
+                        for (DAOTrigger<T> dt : triggerInsertAfter) {
+                            dt.executeTrigger(null, entity, db);
                         }
                     }
                 } finally {
@@ -280,9 +352,12 @@ public abstract class AbstractDao<T, K> {
                 }
             }
             db.setTransactionSuccessful();
-        } finally {
+        } finally
+
+        {
             db.endTransaction();
         }
+
     }
 
     /**
@@ -296,7 +371,7 @@ public abstract class AbstractDao<T, K> {
 
     /**
      * Insert an entity into the table associated with a concrete DAO <b>without</b> setting key property.
-     *
+     * <p>
      * Warning: This may be faster, but the entity should not be used anymore. The entity also won't be attached to
      * identity scope.
      *
@@ -304,22 +379,32 @@ public abstract class AbstractDao<T, K> {
      */
     public long insertWithoutSettingPk(T entity) {
         SQLiteStatement stmt = statements.getInsertStatement();
-        long rowId;
-        if (db.isDbLockedByCurrentThread()) {
-            synchronized (stmt) {
-                bindValues(stmt, entity);
-                rowId = stmt.executeInsert();
+        long rowId = -1;//TODO instead case
+        boolean closeTransantion = false;
+        try {
+            if (!db.isDbLockedByCurrentThread()) {
+                db.beginTransaction();
             }
-        } else {
-            // Do TX to acquire a connection before locking the stmt to avoid deadlocks
-            db.beginTransaction();
-            try {
-                synchronized (stmt) {
+            synchronized (stmt) {
+                for (DAOTrigger<T> dt : triggerInsertBefore) {
+                    dt.executeTrigger(null, entity, db);
+                }
+                if (!triggerInsertInstead.isEmpty()) {
+                    for (DAOTrigger<T> dt : triggerInsertInstead) {
+                        dt.executeTrigger(null, entity, db);
+                    }
+                } else {
                     bindValues(stmt, entity);
                     rowId = stmt.executeInsert();
                 }
+                for (DAOTrigger<T> dt : triggerInsertAfter) {
+                    dt.executeTrigger(null, entity, db);
+                }
+            }
+
+        } finally {
+            if (closeTransantion) {
                 db.setTransactionSuccessful();
-            } finally {
                 db.endTransaction();
             }
         }
@@ -336,26 +421,37 @@ public abstract class AbstractDao<T, K> {
     }
 
     private long executeInsert(T entity, SQLiteStatement stmt) {
-        long rowId;
-        if (db.isDbLockedByCurrentThread()) {
-            synchronized (stmt) {
-                bindValues(stmt, entity);
-                rowId = stmt.executeInsert();
-            }
-        } else {
-            // Do TX to acquire a connection before locking the stmt to avoid deadlocks
+        long rowId = -1;//TODO contemplar caso
+        boolean closeTransaction = false;
+        if (!db.isDbLockedByCurrentThread()) {
+            closeTransaction = true;
             db.beginTransaction();
-            try {
+        }
+        try {
+            for (DAOTrigger<T> dt : triggerInsertBefore) {
+                dt.executeTrigger(null, entity, db);
+            }
+            if (!triggerInsertInstead.isEmpty()) {
+                for (DAOTrigger<T> dt : triggerInsertInstead) {
+                    dt.executeTrigger(null, entity, db);
+                }
+            } else {
                 synchronized (stmt) {
                     bindValues(stmt, entity);
                     rowId = stmt.executeInsert();
                 }
-                db.setTransactionSuccessful();
-            } finally {
+                updateKeyAfterInsertAndAttach(entity, rowId, true);
+            }
+            for (DAOTrigger<T> dt : triggerInsertAfter) {
+                dt.executeTrigger(null, entity, db);
+            }
+        } finally {
+            if (closeTransaction) {
                 db.endTransaction();
+                db.setTransactionSuccessful();
             }
         }
-        updateKeyAfterInsertAndAttach(entity, rowId, true);
+
         return rowId;
     }
 
@@ -369,7 +465,9 @@ public abstract class AbstractDao<T, K> {
         }
     }
 
-    /** Reads all available rows from the given cursor and returns a list of entities. */
+    /**
+     * Reads all available rows from the given cursor and returns a list of entities.
+     */
     protected List<T> loadAllFromCursor(Cursor cursor) {
         int count = cursor.getCount();
         if (count == 0) {
@@ -449,7 +547,9 @@ public abstract class AbstractDao<T, K> {
         }
     }
 
-    /** Internal use only. Considers identity scope. */
+    /**
+     * Internal use only. Considers identity scope.
+     */
     final protected T loadCurrent(Cursor cursor, int offset, boolean lock) {
         if (identityScopeLong != null) {
             if (offset != 0) {
@@ -502,12 +602,16 @@ public abstract class AbstractDao<T, K> {
         }
     }
 
-    /** Internal use only. Considers identity scope. */
+    /**
+     * Internal use only. Considers identity scope.
+     */
     final protected <O> O loadCurrentOther(AbstractDao<O, ?> dao, Cursor cursor, int offset) {
         return dao.loadCurrent(cursor, offset, /* TODO check this */true);
     }
 
-    /** A raw-style query where you can pass any WHERE clause and arguments. */
+    /**
+     * A raw-style query where you can pass any WHERE clause and arguments.
+     */
     public List<T> queryRaw(String where, String... selectionArg) {
         Cursor cursor = db.rawQuery(statements.getSelectAll() + where, selectionArg);
         return loadAllAndCloseCursor(cursor);
@@ -540,14 +644,18 @@ public abstract class AbstractDao<T, K> {
         }
     }
 
-    /** Deletes the given entity from the database. Currently, only single value PK entities are supported. */
+    /**
+     * Deletes the given entity from the database. Currently, only single value PK entities are supported.
+     */
     public void delete(T entity) {
         assertSinglePk();
         K key = getKeyVerified(entity);
         deleteByKey(key);
     }
 
-    /** Deletes an entity with the given PK from the database. Currently, only single value PK entities are supported. */
+    /**
+     * Deletes an entity with the given PK from the database. Currently, only single value PK entities are supported.
+     */
     public void deleteByKey(K key) {
         assertSinglePk();
         SQLiteStatement stmt = statements.getDeleteStatement();
@@ -573,14 +681,41 @@ public abstract class AbstractDao<T, K> {
     }
 
     private void deleteByKeyInsideSynchronized(K key, SQLiteStatement stmt) {
-        if (key instanceof Long) {
-            stmt.bindLong(1, (Long) key);
-        } else if (key == null) {
-            throw new DaoException("Cannot delete entity, key is null");
-        } else {
-            stmt.bindString(1, key.toString());
+        T oldEntity = null;
+        if (!triggerDeleteBefore.isEmpty()) {
+            Long idkey = (Long) key;
+            oldEntity = load(key);
+            for (DAOTrigger<T> dt : triggerDeleteBefore) {
+                dt.executeTrigger(oldEntity, null, db);
+            }
         }
-        stmt.execute();
+        if (!triggerDeleteInstead.isEmpty()) {
+            if (oldEntity == null) {
+                oldEntity = load(key);
+            }
+            for (DAOTrigger dt : triggerDeleteInstead) {
+                dt.executeTrigger(oldEntity, null, db);
+            }
+
+        } else {
+            if (key instanceof Long) {
+                stmt.bindLong(1, (Long) key);
+            } else if (key == null) {
+                throw new DaoException("Cannot delete entity, key is null");
+            } else {
+                stmt.bindString(1, key.toString());
+            }
+            stmt.execute();
+        }
+
+        if (!triggerDeleteAfter.isEmpty()) {
+            if (oldEntity == null) {
+                oldEntity = load(key);
+            }
+            for (DAOTrigger dt : triggerDeleteAfter) {
+                dt.executeTrigger(oldEntity, null, db);
+            }
+        }
     }
 
     private void deleteInTxInternal(Iterable<T> entities, Iterable<K> keys) {
@@ -663,7 +798,9 @@ public abstract class AbstractDao<T, K> {
         deleteInTxInternal(null, Arrays.asList(keys));
     }
 
-    /** Resets all locally changed properties of the entity by reloading the values from the database. */
+    /**
+     * Resets all locally changed properties of the entity by reloading the values from the database.
+     */
     public void refresh(T entity) {
         assertSinglePk();
         K key = getKeyVerified(entity);
@@ -712,18 +849,51 @@ public abstract class AbstractDao<T, K> {
 
     protected void updateInsideSynchronized(T entity, SQLiteStatement stmt, boolean lock) {
         // To do? Check if it's worth not to bind PKs here (performance).
-        bindValues(stmt, entity);
-        int index = config.allColumns.length + 1;
-        K key = getKey(entity);
-        if (key instanceof Long) {
-            stmt.bindLong(index, (Long) key);
-        } else if (key == null) {
-            throw new DaoException("Cannot update entity without key - was it inserted before?");
-        } else {
-            stmt.bindString(index, key.toString());
+        T oldEntity = null;
+        if (!triggerUpdateBefore.isEmpty()) {
+            oldEntity = getObjectFromDatabase(entity);
+            for (DAOTrigger<T> dt : triggerUpdateBefore) {
+                dt.executeTrigger(oldEntity, entity, db);
+            }
         }
-        stmt.execute();
-        attachEntity(key, entity, lock);
+        if (!triggerUpdateInstead.isEmpty()) {
+            if (oldEntity == null) {
+                oldEntity = getObjectFromDatabase(entity);
+            }
+            for (DAOTrigger dt : triggerUpdateInstead) {
+                dt.executeTrigger(oldEntity, entity, db);
+            }
+        } else {
+            bindValues(stmt, entity);
+            int index = config.allColumns.length + 1;
+            K key = getKey(entity);
+            if (key instanceof Long) {
+                stmt.bindLong(index, (Long) key);
+            } else if (key == null) {
+                throw new DaoException("Cannot update entity without key - was it inserted before?");
+            } else {
+                stmt.bindString(index, key.toString());
+            }
+            stmt.execute();
+            attachEntity(key, entity, lock);
+        }
+
+        if (!triggerDeleteAfter.isEmpty()) {
+            if (oldEntity == null) {
+                oldEntity = getObjectFromDatabase(entity);
+            }
+            for (DAOTrigger<T> dt : triggerDeleteAfter) {
+                dt.executeTrigger(oldEntity, entity, db);
+            }
+        }
+    }
+
+    private T getObjectFromDatabase(T entity) {
+        T old = null;
+        if (getPkColumns() != null) {
+            old = queryBuilder().where(getPkProperty().eq(getKey(entity))).unique();
+        }
+        return old;
     }
 
     /**
@@ -812,7 +982,9 @@ public abstract class AbstractDao<T, K> {
         return DatabaseUtils.queryNumEntries(db, '\'' + config.tablename + '\'');
     }
 
-    /** See {@link #getKey(Object)}, but guarantees that the returned key is never null (throws if null). */
+    /**
+     * See {@link #getKey(Object)}, but guarantees that the returned key is never null (throws if null).
+     */
     protected K getKeyVerified(T entity) {
         K key = getKey(entity);
         if (key == null) {
@@ -826,21 +998,31 @@ public abstract class AbstractDao<T, K> {
         }
     }
 
-    /** Gets the SQLiteDatabase for custom database access. Not needed for greenDAO entities. */
+    /**
+     * Gets the SQLiteDatabase for custom database access. Not needed for greenDAO entities.
+     */
     public SQLiteDatabase getDatabase() {
         return db;
     }
 
-    /** Reads the values from the current position of the given cursor and returns a new entity. */
+    /**
+     * Reads the values from the current position of the given cursor and returns a new entity.
+     */
     abstract protected T readEntity(Cursor cursor, int offset);
 
-    /** Reads the key from the current position of the given cursor, or returns null if there's no single-value key. */
+    /**
+     * Reads the key from the current position of the given cursor, or returns null if there's no single-value key.
+     */
     abstract protected K readKey(Cursor cursor, int offset);
 
-    /** Reads the values from the current position of the given cursor into an existing entity. */
+    /**
+     * Reads the values from the current position of the given cursor into an existing entity.
+     */
     abstract protected void readEntity(Cursor cursor, T entity, int offset);
 
-    /** Binds the entity's values to the statement. Make sure to synchronize the statement outside of the method. */
+    /**
+     * Binds the entity's values to the statement. Make sure to synchronize the statement outside of the method.
+     */
     abstract protected void bindValues(SQLiteStatement stmt, T entity);
 
     /**
@@ -855,7 +1037,9 @@ public abstract class AbstractDao<T, K> {
      */
     abstract protected K getKey(T entity);
 
-    /** Returns true if the Entity class can be updated, e.g. for setting the PK after insert. */
+    /**
+     * Returns true if the Entity class can be updated, e.g. for setting the PK after insert.
+     */
     abstract protected boolean isEntityUpdateable();
 
 }
